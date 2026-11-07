@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -37,8 +38,14 @@ class FileIntegrityMonitorTests(unittest.TestCase):
         baseline_data = json.loads(self.baseline.read_text(encoding="utf-8"))
         self.assertEqual(baseline_data["algorithm"], "sha256")
         self.assertIn("nested/note.txt", baseline_data["files"])
+        self.assertIn("nested/note.txt", baseline_data["file_modified_at"])
+        self.assertTrue(
+            baseline_data["file_modified_at"]["nested/note.txt"].endswith("+00:00")
+        )
 
-        result, output, error = self.run_cli("verify", str(self.root), str(self.baseline))
+        result, output, error = self.run_cli(
+            "verify", str(self.root), str(self.baseline)
+        )
 
         self.assertEqual(result, 0, error)
         self.assertIn("No changes detected.", output)
@@ -54,12 +61,34 @@ class FileIntegrityMonitorTests(unittest.TestCase):
         (self.root / "deleted.txt").unlink()
         (self.root / "new.txt").write_text("added", encoding="utf-8")
 
-        result, output, error = self.run_cli("verify", str(self.root), str(self.baseline))
+        result, output, error = self.run_cli(
+            "verify", str(self.root), str(self.baseline)
+        )
 
         self.assertEqual(result, 1, error)
         self.assertIn("[MODIFIED] modified.txt", output)
         self.assertIn("[DELETED] deleted.txt", output)
         self.assertIn("[NEW] new.txt", output)
+
+    def test_verify_reports_timestamp_only_change(self) -> None:
+        file_path = self.root / "file.txt"
+        file_path.write_text("unchanged content", encoding="utf-8")
+        os.utime(file_path, (1_700_000_000, 1_700_000_000))
+
+        result, _, error = self.run_cli("scan", str(self.root), str(self.baseline))
+
+        self.assertEqual(result, 0, error)
+        result, _, error = self.run_cli("verify", str(self.root), str(self.baseline))
+        self.assertEqual(result, 0, error)
+
+        os.utime(file_path, (1_700_000_010, 1_700_000_010))
+        result, output, error = self.run_cli("verify", str(self.root), str(self.baseline))
+
+        self.assertEqual(result, 1, error)
+        self.assertIn("[TIMESTAMP CHANGED] file.txt", output)
+        self.assertIn("Content hash is unchanged; only the timestamp changed.", output)
+        self.assertIn("Baseline last modified (UTC):", output)
+        self.assertIn("Current last modified (UTC):", output)
 
     def test_baseline_inside_monitored_directory_is_excluded(self) -> None:
         # The baseline must not be detected as a new or changing monitored file.
@@ -83,6 +112,24 @@ class FileIntegrityMonitorTests(unittest.TestCase):
         self.assertEqual(result, 2)
         self.assertIn("could not read baseline", error)
 
+    def test_verify_accepts_legacy_baseline_without_timestamps(self) -> None:
+        file_path = self.root / "legacy.txt"
+        file_path.write_text("unchanged", encoding="utf-8")
+        legacy_baseline = {
+            "version": fim.BASELINE_VERSION,
+            "algorithm": fim.HASH_ALGORITHM,
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "files": {"legacy.txt": fim.hash_file(file_path)},
+        }
+        self.baseline.write_text(json.dumps(legacy_baseline), encoding="utf-8")
+
+        result, output, error = self.run_cli(
+            "verify", str(self.root), str(self.baseline)
+        )
+
+        self.assertEqual(result, 0, error)
+        self.assertIn("No changes detected.", output)
+
     def test_missing_directory_fails_explicitly(self) -> None:
         # A missing scan root is an error, not an empty directory.
         missing = self.root / "missing"
@@ -91,6 +138,56 @@ class FileIntegrityMonitorTests(unittest.TestCase):
 
         self.assertEqual(result, 2)
         self.assertIn("does not exist or is not a directory", error)
+
+    def test_single_file_commands_use_default_baseline(self) -> None:
+        file_path = self.root / "important.txt"
+        file_path.write_text("original", encoding="utf-8")
+        file_baseline = self.root / "important.txt.fim.json"
+
+        result, output, error = self.run_cli("scan-file", str(file_path))
+
+        self.assertEqual(result, 0, error)
+        self.assertIn("Baseline saved:", output)
+        self.assertTrue(file_baseline.is_file())
+
+        result, output, error = self.run_cli("verify-file", str(file_path))
+
+        self.assertEqual(result, 0, error)
+        self.assertIn("No changes detected.", output)
+
+        file_path.write_text("changed", encoding="utf-8")
+        result, output, error = self.run_cli("verify-file", str(file_path))
+
+        self.assertEqual(result, 1, error)
+        self.assertIn("[MODIFIED] important.txt", output)
+
+    def test_single_file_verification_reports_deleted_file(self) -> None:
+        file_path = self.root / "important.txt"
+        file_path.write_text("original", encoding="utf-8")
+        result, _, error = self.run_cli("scan-file", str(file_path))
+        self.assertEqual(result, 0, error)
+
+        file_path.unlink()
+        result, output, error = self.run_cli("verify-file", str(file_path))
+
+        self.assertEqual(result, 1, error)
+        self.assertIn("[DELETED] important.txt", output)
+
+    def test_single_file_reports_current_timestamp_when_content_changes(self) -> None:
+        file_path = self.root / "important.txt"
+        file_path.write_text("original", encoding="utf-8")
+        os.utime(file_path, (1_700_000_000, 1_700_000_000))
+        result, _, error = self.run_cli("scan-file", str(file_path))
+        self.assertEqual(result, 0, error)
+
+        file_path.write_text("changed", encoding="utf-8")
+        os.utime(file_path, (1_700_000_010, 1_700_000_010))
+        result, output, error = self.run_cli("verify-file", str(file_path))
+
+        self.assertEqual(result, 1, error)
+        self.assertIn("[MODIFIED] important.txt", output)
+        self.assertIn("Baseline last modified (UTC):", output)
+        self.assertIn("Current last modified (UTC):", output)
 
 
 if __name__ == "__main__":
